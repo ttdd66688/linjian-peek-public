@@ -304,3 +304,5 @@ Codespaces 里要把端口 8513 和 8787 设为公开或转发，再把手机端
 - 不要在他人设备上使用。
 - 回家模式可以只开提醒，不开自动打开目标 App。
 - 评论自动发送建议默认关闭，先用草稿模式确认。
+
+- v0.2.2 hotfix: allow LAN HTTP backend for self-hosted users.
