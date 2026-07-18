@@ -61,7 +61,7 @@ public class LifeState {
             SharedPreferencesCompat prefs = new SharedPreferencesCompat(ctx);
 
             state.put("device_id", AppPrefs.device(ctx));
-            state.put("life_state_version", "0.1.8");
+            state.put("life_state_version", "0.2.3");
             state.put("local_time", formatLocal(now, "HH:mm"));
             state.put("local_date", formatLocal(now, "yyyy-MM-dd"));
             state.put("timezone", TimeZone.getDefault().getID());
@@ -84,6 +84,8 @@ public class LifeState {
             state.put("weather_note", prefs.weatherNote());
             state.put("screen_text", ScreenshotService.screenText());
             state.put("active_reminders", ActiveReminder.config(ctx));
+            state.put("home_mode", HomeMode.config(ctx));
+            state.put("known_apps", AppPrefs.knownAppsJson(ctx));
             state.put("cycle_state", CycleState.collect(ctx));
             state.put("summary", makeSummary(batteryPercent, charging, currentApp, usage.screenTimeMinutes, usage.unlockCount, usageReady));
         } catch (Exception e) {
@@ -96,7 +98,7 @@ public class LifeState {
         try {
             JSONObject s = collect(ctx);
             StringBuilder sb = new StringBuilder();
-            sb.append("生活状态层 v0.1.8\n");
+            sb.append("生活状态层 v0.2.1\n");
             sb.append("时间：").append(s.optString("local_time", "-")).append("  ").append(s.optString("local_date", "-")).append("\n");
             sb.append("电量：").append(s.optInt("battery_percent", -1)).append("%  ").append(s.optBoolean("charging") ? "充电中" : "未充电").append("\n");
             sb.append("网络：").append(s.optString("network_type", "-")).append("  屏幕：").append(s.optBoolean("screen_on") ? "亮" : "灭").append("\n");
@@ -108,6 +110,8 @@ public class LifeState {
             if (!city.isEmpty() || !weather.isEmpty()) sb.append("城市/天气：").append(city).append(city.isEmpty() || weather.isEmpty() ? "" : " · ").append(weather).append("\n");
             sb.append("\n").append(s.optString("summary", ""));
             sb.append("\n\n").append(ActiveReminder.pretty(ctx));
+            sb.append("\n\n").append(HomeMode.pretty(ctx));
+            sb.append("\n\n可打开 App：\n").append(AppPrefs.knownAppsText(ctx));
             sb.append("\n\n").append(CycleState.pretty(ctx));
             return sb.toString();
         } catch (Exception e) { return "生活状态读取失败：" + ScreenshotService.shortMsg(e); }
@@ -115,7 +119,7 @@ public class LifeState {
 
     private static String makeSummary(int battery, boolean charging, String app, int screenMinutes, int unlocks, boolean usageReady) {
         StringBuilder sb = new StringBuilder();
-        sb.append("轻量状态：");
+        sb.append("轻量查岗：");
         if (app != null && app.length() > 0) sb.append("当前在 ").append(app).append("；");
         if (battery >= 0) sb.append("电量 ").append(battery).append("%").append(charging ? "，正在充电；" : "，未充电；");
         if (usageReady) sb.append("今日屏幕约 ").append(screenMinutes).append(" 分钟，解锁 ").append(unlocks).append(" 次。");

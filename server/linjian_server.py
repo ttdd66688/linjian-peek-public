@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""掌心窗 v0.1.8 unified server.
+"""掌心窗 v0.2.4-public unified server.
 
 零依赖标准库版，负责：
 1. 给手机端下发 peek / open_app / back / home / recents / tap / swipe / set_alarm / send_notification 命令；
@@ -23,8 +23,8 @@ from urllib.parse import parse_qs, urlparse
 DEFAULT_PORT = 8513
 DEFAULT_KEEP = 3
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
-VERSION = "0.1.8"
-DEFAULT_DEVICE = os.environ.get("LINJIAN_DEFAULT_DEVICE", "my-phone")
+VERSION = "0.2.4-public"
+DEFAULT_DEVICE = os.environ.get("LINJIAN_DEFAULT_DEVICE", "android-phone")
 
 ERR_BAD_TOKEN = "LINJIAN_ERR_BAD_TOKEN"
 ERR_NO_IMAGE = "LINJIAN_ERR_NO_IMAGE"
@@ -41,7 +41,7 @@ KNOWN_APPS = {
     "Speedcat": "", "speedcat": "",
 }
 SENSITIVE_PACKAGES = {"com.eg.android.AlipayGphone", "com.tencent.mm.plugin.wallet"}
-ALLOWED_ACTIONS = {"noop", "peek", "open_app", "home", "back", "recents", "tap", "swipe", "set_alarm", "send_notification"}
+ALLOWED_ACTIONS = {"noop", "peek", "open_app", "home", "back", "recents", "tap", "swipe", "set_alarm", "send_notification", "run_sequence", "save_known_app", "get_screen_nodes", "tap_text", "input_text"}
 
 
 def load_dotenv(path: Path) -> None:

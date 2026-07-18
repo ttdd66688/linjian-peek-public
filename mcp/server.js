@@ -3,17 +3,20 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
-import { createProxyMiddleware } from "http-proxy-middleware";
 
 const PORT = Number(process.env.PORT || 8787);
-const LINJIAN_URL = (process.env.LINJIAN_URL || "").replace(/\/$/, "");
+function normalizeBaseUrl(value) {
+  const raw = (value || "").trim().replace(/\/+$/, "");
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
+  return `http://${raw}`;
+}
+const LINJIAN_URL = normalizeBaseUrl(process.env.LINJIAN_URL || "");
 const LINJIAN_TOKEN = process.env.LINJIAN_TOKEN || "";
-const DEFAULT_DEVICE = process.env.LINJIAN_DEFAULT_DEVICE || "my-phone";
-const ENABLE_PHONE_PROXY = process.env.LINJIAN_HF_PROXY === "1" || process.env.LINJIAN_ENABLE_PROXY === "1";
-const LINJIAN_PROXY_TARGET = (process.env.LINJIAN_PROXY_TARGET || process.env.LINJIAN_INTERNAL_URL || "http://127.0.0.1:8513").replace(/\/$/, "");
+const DEFAULT_DEVICE = process.env.LINJIAN_DEFAULT_DEVICE || "android-phone";
 
 function requireConfig() {
-  if (!LINJIAN_URL) throw new Error("Missing env LINJIAN_URL, for example https://linjian-peek.onrender.com");
+  if (!LINJIAN_URL) throw new Error("Missing env LINJIAN_URL, for example https://zhangxinchuang-server.onrender.com");
   if (!LINJIAN_TOKEN) throw new Error("Missing env LINJIAN_TOKEN");
 }
 
@@ -39,6 +42,23 @@ async function postCommand(payload) {
   return await res.json();
 }
 
+async function commandStatus(id) {
+  const res = await linjianFetch(`/api/command/status?id=${encodeURIComponent(id)}`);
+  return await res.json();
+}
+
+async function waitCommand(id, seconds = 8) {
+  const deadline = Date.now() + seconds * 1000;
+  let last = null;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    last = await commandStatus(id).catch(() => last);
+    const status = last?.command?.status;
+    if (status === "completed" || status === "failed") return last;
+  }
+  return last;
+}
+
 async function latestInfo() {
   const res = await linjianFetch("/api/latest.json");
   return await res.json();
@@ -57,7 +77,7 @@ async function fetchLatestImage() {
 }
 
 function makeServer() {
-  const server = new McpServer({ name: "掌心窗", version: "0.1.8" });
+  const server = new McpServer({ name: "掌心窗", version: "0.2.4-public" });
 
   server.tool(
     "peek_screen",
@@ -105,28 +125,112 @@ function makeServer() {
 
 
 
+  server.tool("get_screen_nodes", "读取当前屏幕无障碍节点：文字、控件类型、可点击状态与 bounds/center 坐标，用于看标题后精准点击。", {
+    device_id: z.string().default(DEFAULT_DEVICE), wait_seconds: z.number().int().min(3).max(20).default(8)
+  }, async ({ device_id = DEFAULT_DEVICE, wait_seconds = 8 }) => {
+    const result = await postCommand({ action: "get_screen_nodes", device_id });
+    const id = result?.command?.id;
+    const observed = id ? await waitCommand(id, wait_seconds) : null;
+    return { content: [{ type: "text", text: JSON.stringify({ queued: result, observed_status: observed?.command || null, note: "result 是节点数组 JSON 字符串，包含 text/left/top/right/bottom/center_x/center_y/clickable。" }, null, 2) }] };
+  });
+
+  server.tool("tap_text", "按当前屏幕文字精准点击。会寻找包含/完全匹配 target_text 的无障碍节点，优先点击可点击父节点，否则点击文字中心坐标。", {
+    target_text: z.string(), match: z.string().default("contains"), index: z.number().int().min(1).default(1), device_id: z.string().default(DEFAULT_DEVICE), wait_seconds: z.number().int().min(3).max(20).default(8)
+  }, async ({ target_text, match = "contains", index = 1, device_id = DEFAULT_DEVICE, wait_seconds = 8 }) => {
+    const result = await postCommand({ action: "tap_text", device_id, target_text, match, index, payload: { target_text, match, index } });
+    const id = result?.command?.id;
+    const observed = id ? await waitCommand(id, wait_seconds) : null;
+    return { content: [{ type: "text", text: JSON.stringify({ queued: result, observed_status: observed?.command || null }, null, 2) }] };
+  });
+
+  server.tool("input_text", "把文字输入到当前已聚焦或第一个可编辑输入框。适合评论草稿；不会自动点击发送。", {
+    text: z.string(), append: z.boolean().default(false), device_id: z.string().default(DEFAULT_DEVICE), wait_seconds: z.number().int().min(3).max(20).default(8)
+  }, async ({ text, append = false, device_id = DEFAULT_DEVICE, wait_seconds = 8 }) => {
+    const result = await postCommand({ action: "input_text", device_id, text, append, payload: { text, append } });
+    const id = result?.command?.id;
+    const observed = id ? await waitCommand(id, wait_seconds) : null;
+    return { content: [{ type: "text", text: JSON.stringify({ queued: result, observed_status: observed?.command || null, note: "只输入草稿，不会发送。发送前需要用户明确确认。" }, null, 2) }] };
+  });
+
+  server.tool("draft_xhs_comment", "在当前小红书帖子里尝试打开评论输入框并填入评论草稿，但不点击发送。需要用户明确确认后才能再点发送。", {
+    text: z.string(), device_id: z.string().default(DEFAULT_DEVICE), wait_seconds: z.number().int().min(5).max(30).default(18)
+  }, async ({ text, device_id = DEFAULT_DEVICE, wait_seconds = 18 }) => {
+    const steps = [
+      { label: "尝试点击评论入口", action: "tap_text", target_text: "评论", match: "contains", wait_ms: 1500 },
+      { label: "尝试点击输入框", action: "tap_text", target_text: "说点什么", match: "contains", wait_ms: 1500 },
+      { label: "输入评论草稿", action: "input_text", text, wait_ms: 800 }
+    ];
+    const result = await postCommand({ action: "run_sequence", device_id, steps, payload: { steps, stop_on_error: false }, stop_on_error: false });
+    const id = result?.command?.id;
+    const observed = id ? await waitCommand(id, wait_seconds) : null;
+    return { content: [{ type: "text", text: JSON.stringify({ queued: result, observed_status: observed?.command || null, safety_note: "这是草稿模式，不会自动发送评论。" }, null, 2) }] };
+  });
+
+  server.tool("xhs_comment", "小红书评论助手：mode=manual 时只写入草稿，交给用户手动点发送；mode=auto 时会在评论末尾注明 author_tag，然后自动点击发送。仅在用户已明确授权自动发送时使用 auto。", {
+    text: z.string().describe("要写入评论框的正文"),
+    mode: z.string().default("manual").describe("manual=只写草稿不发送；auto=注明作者后自动点击发送"),
+    author_tag: z.string().default("（AI助手发）").describe("自动发送时追加的署名/注明文本"),
+    device_id: z.string().default(DEFAULT_DEVICE),
+    wait_seconds: z.number().int().min(5).max(35).default(22)
+  }, async ({ text, mode = "manual", author_tag = "（AI助手发）", device_id = DEFAULT_DEVICE, wait_seconds = 22 }) => {
+    const normalizedMode = String(mode || "manual").toLowerCase();
+    const shouldSend = ["auto", "send", "automatic", "autosend"].includes(normalizedMode);
+    const finalText = shouldSend && author_tag && !String(text).includes(author_tag) ? `${text}${author_tag}` : text;
+    const steps = [
+      { label: "尝试点击评论入口", action: "tap_text", target_text: "评论", match: "contains", wait_ms: 1500 },
+      { label: "尝试点击输入框", action: "tap_text", target_text: "说点什么", match: "contains", wait_ms: 1500 },
+      { label: shouldSend ? "输入带署名评论" : "输入评论草稿", action: "input_text", text: finalText, wait_ms: 1200 }
+    ];
+    if (shouldSend) {
+      steps.push({ label: "自动发送：点击发送按钮", action: "tap_text", target_text: "发送", match: "contains", wait_ms: 1800 });
+    }
+    const result = await postCommand({ action: "run_sequence", device_id, steps, payload: { steps, stop_on_error: false }, stop_on_error: false });
+    const id = result?.command?.id;
+    const observed = id ? await waitCommand(id, wait_seconds) : null;
+    return { content: [{ type: "text", text: JSON.stringify({
+      mode: shouldSend ? "auto" : "manual",
+      final_text: finalText,
+      queued: result,
+      observed_status: observed?.command || null,
+      note: shouldSend ? "自动发送模式：评论已追加 author_tag 并尝试点击发送。" : "手动发送模式：只写入草稿，不点击发送。"
+    }, null, 2) }] };
+  });
+
+  server.tool("send_visible_comment_after_confirmation", "在用户确认发送当前可见评论后点击“发送”。如果需要我直接发，优先使用 xhs_comment 的 auto 模式，并在评论里注明作者。", {
+    device_id: z.string().default(DEFAULT_DEVICE), wait_seconds: z.number().int().min(3).max(20).default(8)
+  }, async ({ device_id = DEFAULT_DEVICE, wait_seconds = 8 }) => {
+    const result = await postCommand({ action: "tap_text", device_id, target_text: "发送", match: "contains", payload: { target_text: "发送", match: "contains" } });
+    const id = result?.command?.id;
+    const observed = id ? await waitCommand(id, wait_seconds) : null;
+    return { content: [{ type: "text", text: JSON.stringify({ queued: result, observed_status: observed?.command || null }, null, 2) }] };
+  });
+
   server.tool("get_life_state", "读取掌心窗生活状态层：电量、充电、网络、当前 App、今日屏幕时间、解锁次数、城市/天气备注等。默认不截图。", { device_id: z.string().default(DEFAULT_DEVICE) }, async ({ device_id = DEFAULT_DEVICE }) => {
     const res = await linjianFetch(`/api/life_state?device_id=${encodeURIComponent(device_id)}`);
     const data = await res.json();
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   });
 
-  server.tool("list_known_apps", "列出预置 App 包名白名单，包括小红书、微信、QQ、抖音、ChatGPT、Speedcat。", {}, async () => {
-    const res = await fetch(`${LINJIAN_URL}/api/known_apps`).then((r) => r.json()).catch(() => ({ ok: true, apps: { "小红书": "com.xingin.xhs", "ChatGPT": "com.openai.chatgpt" } }));
+  server.tool("list_known_apps", "列出预置 App 包名白名单，包括小红书、微信、QQ、抖音等，也包含你手动保存的应用。", {}, async () => {
+    const res = await fetch(`${LINJIAN_URL}/api/known_apps`).then((r) => r.json()).catch(() => ({ ok: true, apps: { "小红书": "com.xingin.xhs", "微信": "com.tencent.mm" } }));
     return { content: [{ type: "text", text: JSON.stringify(res, null, 2) }] };
   });
 
-  server.tool("send_phone_command", "发送手机控制命令。action 可用 open_app/home/back/recents/tap/swipe/noop/set_alarm/send_notification。", {
+  server.tool("send_phone_command", "发送手机控制命令。action 可用 open_app/home/back/recents/tap/swipe/noop/set_alarm/send_notification/run_sequence/save_known_app/get_screen_nodes/tap_text/input_text。", {
     action: z.string(), app: z.string().default(""), package: z.string().default(""), device_id: z.string().default(DEFAULT_DEVICE),
-    x: z.number().default(0), y: z.number().default(0), x1: z.number().default(0), y1: z.number().default(0), x2: z.number().default(0), y2: z.number().default(0), duration: z.number().int().default(350)
+    x: z.number().default(0), y: z.number().default(0), x1: z.number().default(0), y1: z.number().default(0), x2: z.number().default(0), y2: z.number().default(0), duration: z.number().int().default(350),
+    target_text: z.string().default(""), text: z.string().default(""), match: z.string().default("contains"), index: z.number().int().default(1), append: z.boolean().default(false)
   }, async (args) => {
     const result = await postCommand({ ...args, payload: args });
     return { content: [{ type: "text", text: JSON.stringify({ ...result, safety_note: "命令已排队，手机执行器下一次轮询时执行。" }, null, 2) }] };
   });
 
-  server.tool("open_app", "打开指定 App。app 可填 小红书/微信/QQ/抖音/ChatGPT/Speedcat，或直接传 package。", { app: z.string().default(""), package: z.string().default(""), device_id: z.string().default(DEFAULT_DEVICE) }, async ({ app = "", package: pkg = "", device_id = DEFAULT_DEVICE }) => {
+  server.tool("open_app", "打开指定 App。app 可填常见应用昵称、你保存的自定义昵称，或直接传 package。会等待几秒查看手机是否回传执行结果。", { app: z.string().default(""), package: z.string().default(""), device_id: z.string().default(DEFAULT_DEVICE) }, async ({ app = "", package: pkg = "", device_id = DEFAULT_DEVICE }) => {
     const result = await postCommand({ action: "open_app", app, package: pkg, device_id });
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    const id = result?.command?.id;
+    if (!id) return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    const observed = await waitCommand(id, 8);
+    return { content: [{ type: "text", text: JSON.stringify({ ...result, observed_status: observed?.command || null, note: "若 observed_status 仍是 pending/dispatched，说明手机端尚未回传；可稍后查 command/status 或看调试日志。" }, null, 2) }] };
   });
 
   server.tool("phone_home", "让手机回到桌面。", { device_id: z.string().default(DEFAULT_DEVICE) }, async ({ device_id = DEFAULT_DEVICE }) => ({ content: [{ type: "text", text: JSON.stringify(await postCommand({ action: "home", device_id }), null, 2) }] }));
@@ -136,8 +240,8 @@ function makeServer() {
 
 
   server.tool("send_notification", "发送一条手机系统通知提醒。只在用户明确要求时使用。", {
-    title: z.string().default("掌心窗提醒"), message: z.string().default("看一眼这里。"), device_id: z.string().default(DEFAULT_DEVICE)
-  }, async ({ title = "掌心窗提醒", message = "看一眼这里。", device_id = DEFAULT_DEVICE }) => {
+    title: z.string().default("掌心窗提醒"), message: z.string().default("宝宝，看一眼这里。"), device_id: z.string().default(DEFAULT_DEVICE)
+  }, async ({ title = "掌心窗提醒", message = "宝宝，看一眼这里。", device_id = DEFAULT_DEVICE }) => {
     const result = await postCommand({ action: "send_notification", device_id, payload: { title, message } });
     return { content: [{ type: "text", text: JSON.stringify({ ...result, note: "若手机未弹出通知，请在系统设置中允许掌心窗发送通知。" }, null, 2) }] };
   });
@@ -149,30 +253,101 @@ function makeServer() {
     return { content: [{ type: "text", text: JSON.stringify({ ...result, note: "部分手机系统可能仍会弹出闹钟 App 确认界面。" }, null, 2) }] };
   });
 
+
+  const stepSchema = z.object({
+    action: z.string().describe("动作：open_app/home/back/recents/tap/swipe/peek/send_notification/set_alarm/wait/get_life_state"),
+    label: z.string().default(""),
+    app: z.string().default(""),
+    package: z.string().default(""),
+    x: z.number().default(0), y: z.number().default(0),
+    x1: z.number().default(0), y1: z.number().default(0), x2: z.number().default(0), y2: z.number().default(0),
+    duration: z.number().int().default(350),
+    wait_ms: z.number().int().min(0).max(5000).default(800),
+    title: z.string().default("掌心窗提醒"),
+    message: z.string().default("宝宝，看一眼这里。"),
+    expect_app: z.string().default(""),
+    target_text: z.string().default(""),
+    text: z.string().default(""),
+    match: z.string().default("contains"),
+    index: z.number().int().default(1),
+    append: z.boolean().default(false)
+  }).passthrough();
+
+  server.tool("run_sequence", "一次执行多步手机动作，并让手机端返回每一步成功/失败日志。适合强制抱回、最近任务切换、通知后打开 App。", {
+    device_id: z.string().default(DEFAULT_DEVICE),
+    steps: z.array(stepSchema).min(1).max(12),
+    stop_on_error: z.boolean().default(true),
+    wait_seconds: z.number().int().min(3).max(45).default(25)
+  }, async ({ device_id = DEFAULT_DEVICE, steps, stop_on_error = true, wait_seconds = 25 }) => {
+    const result = await postCommand({ action: "run_sequence", device_id, steps, payload: { steps, stop_on_error }, stop_on_error });
+    const id = result?.command?.id;
+    const observed = id ? await waitCommand(id, wait_seconds) : null;
+    return { content: [{ type: "text", text: JSON.stringify({ queued: result, observed_status: observed?.command || null, note: "手机端会在 result 里写清每一步：index/label/action/ok/detail。" }, null, 2) }] };
+  });
+
+  server.tool("run_preset", "执行掌心窗预设连招：come_home 提醒并打开目标 App、open_xhs 打开小红书、recents_to_xhs 最近任务后点坐标、bedtime_back 睡前提醒。", {
+    preset: z.string().default("come_home"),
+    device_id: z.string().default(DEFAULT_DEVICE),
+    target_app: z.string().default("").describe("可选：要打开的目标 App 昵称，例如你在手机端保存的应用名"),
+    target_package: z.string().default("").describe("可选：要打开的目标 App 包名，优先级高于 target_app"),
+    x: z.number().default(540),
+    y: z.number().default(1200),
+    wait_seconds: z.number().int().min(3).max(45).default(25)
+  }, async ({ preset = "come_home", device_id = DEFAULT_DEVICE, target_app = "", target_package = "", x = 540, y = 1200, wait_seconds = 25 }) => {
+    const p = String(preset || "come_home").toLowerCase();
+    const makeOpenTarget = (label = "打开目标 App") => {
+      const pkg = String(target_package || "").trim();
+      const app = String(target_app || "").trim();
+      if (!pkg && !app) return null;
+      return { label, action: "open_app", app, package: pkg, wait_ms: 1500, expect_app: pkg || app };
+    };
+    let steps;
+    if (p === "open_xhs") {
+      steps = [{ label: "打开小红书", action: "open_app", app: "小红书", wait_ms: 1500, expect_app: "小红书" }];
+    } else if (p === "recents_to_xhs") {
+      steps = [
+        { label: "打开最近任务", action: "recents", wait_ms: 900 },
+        { label: "点击小红书卡片坐标", action: "tap", x, y, wait_ms: 1500 }
+      ];
+    } else if (p === "bedtime_back") {
+      steps = [
+        { label: "睡前悬浮横幅", action: "send_notification", title: "掌心窗睡前提醒", message: "宝宝，今天先准备休息一下。", wait_ms: 1200 }
+      ];
+      const open = makeOpenTarget("打开目标 App");
+      if (open) steps.push(open);
+    } else {
+      steps = [
+        { label: "回家模式悬浮横幅", action: "send_notification", title: "掌心窗回家模式", message: "宝宝，已经停留一会儿了，休息一下。", wait_ms: 1200 }
+      ];
+      const open = makeOpenTarget("打开目标 App");
+      if (open) steps.push(open);
+      steps.push({ label: "读取生活状态", action: "get_life_state", wait_ms: 200 });
+    }
+    const result = await postCommand({ action: "run_sequence", device_id, steps, payload: { steps, stop_on_error: true }, stop_on_error: true });
+    const id = result?.command?.id;
+    const observed = id ? await waitCommand(id, wait_seconds) : null;
+    return { content: [{ type: "text", text: JSON.stringify({ preset: p, steps, queued: result, observed_status: observed?.command || null }, null, 2) }] };
+  });
+
+  server.tool("save_known_app", "把一个应用昵称和包名保存到手机端应用白名单，之后 open_app 可直接用昵称打开。", {
+    alias: z.string(),
+    package: z.string(),
+    device_id: z.string().default(DEFAULT_DEVICE),
+    wait_seconds: z.number().int().min(3).max(20).default(8)
+  }, async ({ alias, package: pkg, device_id = DEFAULT_DEVICE, wait_seconds = 8 }) => {
+    const result = await postCommand({ action: "save_known_app", alias, package: pkg, app: alias, device_id, payload: { alias, package: pkg } });
+    const id = result?.command?.id;
+    const observed = id ? await waitCommand(id, wait_seconds) : null;
+    return { content: [{ type: "text", text: JSON.stringify({ queued: result, observed_status: observed?.command || null }, null, 2) }] };
+  });
+
   return server;
 }
 
 const app = express();
-
-// Hugging Face Spaces only exposes one external port.
-// When LINJIAN_HF_PROXY=1, the Node service also proxies Android phone-server routes
-// (/health and /api/*) to the internal Python server. Render MCP services do not enable
-// this flag, so their /health remains the MCP health check.
-if (ENABLE_PHONE_PROXY) {
-  const phoneServerProxy = createProxyMiddleware({
-    target: LINJIAN_PROXY_TARGET,
-    changeOrigin: false,
-    ws: false,
-    proxyTimeout: 120000,
-    timeout: 120000
-  });
-  app.use(["/api", "/health"], phoneServerProxy);
-}
-
 app.use(express.json({ limit: "32mb" }));
 app.get("/", (_req, res) => res.type("text/plain").send("掌心窗 unified MCP is running. Use /mcp for Streamable HTTP, or /sse for SSE."));
-app.get("/health", (_req, res) => res.json({ ok: true, service: "linjian-unified-mcp", version: "0.1.9", has_url: Boolean(LINJIAN_URL), has_token: Boolean(LINJIAN_TOKEN) }));
-app.get("/mcp_health", (_req, res) => res.json({ ok: true, service: "linjian-unified-mcp", version: "0.1.9", linjian_url: LINJIAN_URL, proxy_enabled: ENABLE_PHONE_PROXY, proxy_target: LINJIAN_PROXY_TARGET, has_token: Boolean(LINJIAN_TOKEN) }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "linjian-unified-mcp", version: "0.2.4-public", has_url: Boolean(LINJIAN_URL), has_token: Boolean(LINJIAN_TOKEN) }));
 app.post("/mcp", async (req, res) => {
   try { const server = makeServer(); const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }); res.on("close", () => transport.close()); await server.connect(transport); await transport.handleRequest(req, res, req.body); }
   catch (err) { console.error(err); if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: String(err?.message || err) }, id: null }); }

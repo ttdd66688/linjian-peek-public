@@ -57,7 +57,7 @@ if [ ! -f "$DEBUG_KS" ]; then
         -alias linjian-peek \
         -storepass linjian-debug \
         -keypass linjian-debug \
-        -dname "CN=Linjian Peek v0.1.8 Debug"
+        -dname "CN=Zhangxinchuang Public v0.2.4 Debug"
 fi
 
 echo "=== Aligning ==="
@@ -69,10 +69,10 @@ $BUILD_TOOLS/apksigner sign \
     --ks-pass pass:linjian-debug \
     --key-pass pass:linjian-debug \
     --ks-key-alias linjian-peek \
-    --out "$PROJECT/PalmWindow-v0.1.8.apk" \
+    --out "$PROJECT/Zhangxinchuang-public-v0.2.4.apk" \
     app.aligned.apk
 
 echo ""
 echo "=== Done ==="
-echo "APK: $PROJECT/PalmWindow-v0.1.8.apk"
-ls -lh "$PROJECT/PalmWindow-v0.1.8.apk"
+echo "APK: $PROJECT/Zhangxinchuang-public-v0.2.4.apk"
+ls -lh "$PROJECT/Zhangxinchuang-public-v0.2.4.apk"

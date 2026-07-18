@@ -9,6 +9,7 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
@@ -16,6 +17,7 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.provider.AlarmClock;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
@@ -24,10 +26,11 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 public class CompanionService extends Service {
     private static final String CHANNEL_ID = "linjian_peek_service";
-    private static final String REMINDER_CHANNEL_ID = "linjian_peek_reminders";
+    private static final String REMINDER_CHANNEL_ID = "linjian_peek_heads_up_v3";
     private static final int NOTIFICATION_ID = 20260715;
     private static volatile boolean running = false;
 
@@ -55,7 +58,7 @@ public class CompanionService extends Service {
             DebugState.append(this, "服务启动失败：服务器地址或 Token 为空");
             stopSelf(); return START_NOT_STICKY;
         }
-        DebugState.append(this, "掌心窗 v0.1.8 服务已启动，目标：" + serverUrl);
+        DebugState.append(this, "掌心窗 v0.2.3 服务已启动，目标：" + serverUrl);
         if (!running) { running = true; startPolling(); } else DebugState.append(this, "服务已在运行，继续轮询");
         return START_STICKY;
     }
@@ -119,40 +122,194 @@ public class CompanionService extends Service {
             String message = cmd.optString("message", "掌心窗闹钟");
             boolean vibrate = cmd.optBoolean("vibrate", true);
             boolean skipUi = cmd.optBoolean("skip_ui", true);
-            executeCommand(ctx, id, action, app, pkg, x, y, x1, y1, x2, y2, duration, hour, minute, title, message, vibrate, serverUrl, token, skipUi);
+            String targetText = cmd.optString("target_text", cmd.optString("query", ""));
+            String inputText = cmd.optString("text", cmd.optString("input_text", ""));
+            String match = cmd.optString("match", "contains");
+            int index = cmd.optInt("index", 1);
+            boolean append = cmd.optBoolean("append", false);
+            if ("save_known_app".equals(action)) {
+                String alias = cmd.optString("alias", app);
+                String p = cmd.optString("package", pkg);
+                AppPrefs.saveCustomApp(ctx, alias, p);
+                String result = "saved_known_app:" + alias + "=" + p;
+                DebugState.append(ctx, result);
+                try { reportCommand(ctx, serverUrl, token, id, true, result); uploadState(serverUrl, token, ctx); } catch (Exception ignored) { }
+                return;
+            }
+            if ("run_sequence".equals(action)) {
+                executeSequence(ctx, id, cmd, serverUrl, token);
+                return;
+            }
+            executeCommand(ctx, id, action, app, pkg, x, y, x1, y1, x2, y2, duration, hour, minute, title, message, vibrate, serverUrl, token, skipUi, targetText, inputText, match, index, append);
         } catch (Exception e) { DebugState.append(ctx, "命令解析异常：" + ScreenshotService.shortMsg(e)); }
     }
 
     private static void executeCommand(Context ctx, String id, String action, String app, String pkg, float x, float y, float x1, float y1, float x2, float y2, long duration, int hour, int minute, String title, String message, boolean vibrate, String serverUrl, String token) {
-        executeCommand(ctx, id, action, app, pkg, x, y, x1, y1, x2, y2, duration, hour, minute, title, message, vibrate, serverUrl, token, true);
+        executeCommand(ctx, id, action, app, pkg, x, y, x1, y1, x2, y2, duration, hour, minute, title, message, vibrate, serverUrl, token, true, "", "", "contains", 1, false);
     }
 
     private static void executeCommand(Context ctx, String id, String action, String app, String pkg, float x, float y, float x1, float y1, float x2, float y2, long duration, int hour, int minute, String title, String message, boolean vibrate, String serverUrl, String token, boolean skipUi) {
-        boolean ok = false; String result = "";
-        try {
-            ScreenshotService svc = ScreenshotService.getInstance();
-            if ("peek".equals(action)) {
-                if (svc != null) { svc.doScreenshot(serverUrl, token); ok = true; result = "screenshot requested"; }
-                else result = "accessibility service not ready";
-            } else if ("open_app".equals(action)) {
-                if (pkg == null || pkg.length() == 0) pkg = AppPrefs.packageForApp(ctx, app);
-                ok = openPackage(ctx, pkg); result = ok ? "opened " + pkg : "cannot open " + pkg;
-            } else if ("home".equals(action)) { ok = svc != null && svc.doHome(); result = "home";
-            } else if ("back".equals(action)) { ok = svc != null && svc.doBack(); result = "back";
-            } else if ("recents".equals(action)) { ok = svc != null && svc.doRecents(); result = "recents";
-            } else if ("tap".equals(action)) { ok = svc != null && svc.doTap(x, y); result = "tap";
-            } else if ("swipe".equals(action)) { ok = svc != null && svc.doSwipe(x1, y1, x2, y2, duration); result = "swipe";
-            } else if ("set_alarm".equals(action)) { ok = setAlarm(ctx, hour, minute, message, vibrate, skipUi); result = ok ? "alarm " + hour + ":" + minute : "cannot set alarm";
-            } else if ("send_notification".equals(action)) { ok = showReminderNotification(ctx, title, message); result = ok ? "notification sent" : "notification permission missing";
-            } else { ok = true; result = "noop"; }
-        } catch (Exception e) { result = ScreenshotService.shortMsg(e); }
+        executeCommand(ctx, id, action, app, pkg, x, y, x1, y1, x2, y2, duration, hour, minute, title, message, vibrate, serverUrl, token, skipUi, "", "", "contains", 1, false);
+    }
+
+    private static void executeCommand(Context ctx, String id, String action, String app, String pkg, float x, float y, float x1, float y1, float x2, float y2, long duration, int hour, int minute, String title, String message, boolean vibrate, String serverUrl, String token, boolean skipUi, String targetText, String inputText, String match, int index, boolean append) {
+        JSONObject one = performAction(ctx, action, app, pkg, x, y, x1, y1, x2, y2, duration, hour, minute, title, message, vibrate, serverUrl, token, skipUi, targetText, inputText, match, index, append);
+        boolean ok = one.optBoolean("ok", false);
+        String result = one.optString("result", one.toString());
         DebugState.append(ctx, "执行命令 " + action + "：" + result);
         try { reportCommand(ctx, serverUrl, token, id, ok, result); uploadState(serverUrl, token, ctx); } catch (Exception ignored) { }
     }
 
-    private static boolean openPackage(Context ctx, String pkg) {
-        if (pkg == null || pkg.trim().isEmpty()) return false;
-        try { PackageManager pm = ctx.getPackageManager(); Intent i = pm.getLaunchIntentForPackage(pkg.trim()); if (i == null) return false; i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); ctx.startActivity(i); return true; } catch (Exception e) { return false; }
+    private static JSONObject performAction(Context ctx, String action, String app, String pkg, float x, float y, float x1, float y1, float x2, float y2, long duration, int hour, int minute, String title, String message, boolean vibrate, String serverUrl, String token, boolean skipUi, String targetText, String inputText, String match, int index, boolean append) {
+        JSONObject out = new JSONObject();
+        boolean ok = false; String result = "";
+        try {
+            ScreenshotService svc = ScreenshotService.getInstance();
+            if ("wait".equals(action)) { ok = true; result = "wait";
+            } else if ("get_life_state".equals(action)) { ok = true; result = LifeState.collect(ctx).toString();
+            } else if ("get_screen_nodes".equals(action)) {
+                if (svc != null) { svc.refreshScreenModel(); ok = true; result = svc.getScreenNodesJsonNow(); }
+                else result = "accessibility service not ready";
+            } else if ("tap_text".equals(action)) {
+                if (svc != null) { JSONObject rr = svc.tapText(targetText, match, index); ok = rr.optBoolean("ok", false); result = rr.toString(); }
+                else result = "accessibility service not ready";
+            } else if ("input_text".equals(action)) {
+                if (svc != null) { JSONObject rr = svc.inputText(inputText, append); ok = rr.optBoolean("ok", false); result = rr.toString(); }
+                else result = "accessibility service not ready";
+            } else if ("peek".equals(action)) {
+                if (svc != null) { svc.doScreenshot(serverUrl, token); ok = true; result = "screenshot requested"; }
+                else result = "accessibility service not ready";
+            } else if ("open_app".equals(action)) {
+                if (pkg == null || pkg.length() == 0) pkg = AppPrefs.packageForApp(ctx, app);
+                result = openPackageResult(ctx, pkg);
+                ok = result.startsWith("opened_");
+            } else if ("home".equals(action)) { ok = svc != null && svc.doHome(); result = ok ? "home" : "home_failed_or_accessibility_missing";
+            } else if ("back".equals(action)) { ok = svc != null && svc.doBack(); result = ok ? "back" : "back_failed_or_accessibility_missing";
+            } else if ("recents".equals(action)) { ok = svc != null && svc.doRecents(); result = ok ? "recents" : "recents_failed_or_accessibility_missing";
+            } else if ("tap".equals(action)) { ok = svc != null && svc.doTap(x, y); result = ok ? ("tap:" + x + "," + y) : "tap_failed_or_accessibility_missing";
+            } else if ("swipe".equals(action)) { ok = svc != null && svc.doSwipe(x1, y1, x2, y2, duration); result = ok ? "swipe" : "swipe_failed_or_accessibility_missing";
+            } else if ("set_alarm".equals(action)) { ok = setAlarm(ctx, hour, minute, message, vibrate, skipUi); result = ok ? "alarm " + hour + ":" + minute : "cannot set alarm";
+            } else if ("send_notification".equals(action)) { ok = showReminderNotification(ctx, title, message); result = ok ? "heads_up_notification_sent" : "notification permission missing";
+            } else { ok = true; result = "noop"; }
+        } catch (Exception e) { result = ScreenshotService.shortMsg(e); }
+        try { out.put("ok", ok); out.put("action", action); out.put("result", result); } catch (Exception ignored) { }
+        return out;
+    }
+
+    private static void executeSequence(Context ctx, String id, JSONObject cmd, String serverUrl, String token) {
+        JSONArray report = new JSONArray();
+        boolean allOk = true;
+        int executed = 0;
+        boolean stopOnError = cmd.optBoolean("stop_on_error", true);
+        JSONArray steps = cmd.optJSONArray("steps");
+        if (steps == null) {
+            JSONObject payload = cmd.optJSONObject("payload");
+            if (payload != null) steps = payload.optJSONArray("steps");
+        }
+        if (steps == null) steps = new JSONArray();
+        int count = Math.min(12, steps.length());
+        DebugState.append(ctx, "开始执行动作序列：" + count + " 步，stop_on_error=" + stopOnError);
+        for (int i = 0; i < count; i++) {
+            JSONObject stepReport = new JSONObject();
+            try {
+                JSONObject step = steps.optJSONObject(i);
+                if (step == null) step = new JSONObject();
+                String action = step.optString("action", "noop");
+                String label = step.optString("label", action);
+                String app = step.optString("app", "");
+                String pkg = step.optString("package", step.optString("pkg", ""));
+                float x = (float) step.optDouble("x", 0); float y = (float) step.optDouble("y", 0);
+                float x1 = (float) step.optDouble("x1", 0); float y1 = (float) step.optDouble("y1", 0);
+                float x2 = (float) step.optDouble("x2", 0); float y2 = (float) step.optDouble("y2", 0);
+                long duration = step.optLong("duration", 350);
+                int hour = step.optInt("hour", -1); int minute = step.optInt("minute", -1);
+                String title = step.optString("title", "掌心窗提醒");
+                String message = step.optString("message", "宝宝，看一眼这里。");
+                boolean vibrate = step.optBoolean("vibrate", true);
+                boolean skipUi = step.optBoolean("skip_ui", true);
+                String targetText = step.optString("target_text", step.optString("query", ""));
+                String inputText = step.optString("text", step.optString("input_text", ""));
+                String match = step.optString("match", "contains");
+                int textIndex = step.optInt("index", 1);
+                boolean append = step.optBoolean("append", false);
+                JSONObject r = performAction(ctx, action, app, pkg, x, y, x1, y1, x2, y2, duration, hour, minute, title, message, vibrate, serverUrl, token, skipUi, targetText, inputText, match, textIndex, append);
+                int wait = clampWait(step.optInt("wait_ms", step.optInt("delay_ms", 0)));
+                if (wait > 0) Thread.sleep(wait);
+                String expect = step.optString("expect_app", "").trim();
+                if (expect.length() > 0) {
+                    String expectedPkg = AppPrefs.packageForApp(ctx, expect);
+                    if (expectedPkg.length() == 0 && AppPrefs.isPackageLike(expect)) expectedPkg = expect;
+                    String current = ScreenshotService.currentPackage();
+                    boolean match = current != null && current.equals(expectedPkg);
+                    r.put("expect_app", expect);
+                    r.put("expected_package", expectedPkg);
+                    r.put("current_package", current == null ? "" : current);
+                    r.put("expect_ok", match);
+                    if (!match) r.put("ok", false);
+                }
+                boolean ok = r.optBoolean("ok", false);
+                stepReport.put("index", i + 1); stepReport.put("label", label); stepReport.put("action", action); stepReport.put("ok", ok); stepReport.put("detail", r);
+                report.put(stepReport);
+                executed++;
+                DebugState.append(ctx, "序列步骤 " + (i + 1) + "/" + count + " [" + label + "]：" + r.optString("result", ""));
+                if (!ok) { allOk = false; if (stopOnError) break; }
+            } catch (Exception e) {
+                allOk = false;
+                try { stepReport.put("index", i + 1); stepReport.put("ok", false); stepReport.put("error", ScreenshotService.shortMsg(e)); report.put(stepReport); } catch (Exception ignored) { }
+                DebugState.append(ctx, "序列步骤 " + (i + 1) + " 异常：" + ScreenshotService.shortMsg(e));
+                if (stopOnError) break;
+            }
+        }
+        JSONObject finalReport = new JSONObject();
+        try {
+            finalReport.put("ok", allOk);
+            finalReport.put("executed", executed);
+            finalReport.put("total", count);
+            finalReport.put("current_package", ScreenshotService.currentPackage());
+            finalReport.put("steps", report);
+        } catch (Exception ignored) { }
+        DebugState.append(ctx, "动作序列结束：" + (allOk ? "全部成功" : "有步骤失败") + "，执行 " + executed + "/" + count);
+        try { reportCommand(ctx, serverUrl, token, id, allOk, finalReport.toString()); uploadState(serverUrl, token, ctx); } catch (Exception ignored) { }
+    }
+
+    private static int clampWait(int v) { return Math.max(0, Math.min(5000, v)); }
+
+    public static String openPackageResult(Context ctx, String pkg) {
+        if (pkg == null || pkg.trim().isEmpty()) return "package_empty";
+        String target = pkg.trim();
+        try {
+            PackageManager pm = ctx.getPackageManager();
+            try { pm.getPackageInfo(target, 0); } catch (Exception missing) { return "package_not_found:" + target; }
+
+            Intent standard = pm.getLaunchIntentForPackage(target);
+            if (standard != null) {
+                standard.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                try {
+                    ctx.startActivity(standard);
+                    return "opened_standard:" + target;
+                } catch (Exception e) {
+                    DebugState.append(ctx, "标准启动失败 " + target + "：" + ScreenshotService.shortMsg(e));
+                }
+            }
+
+            Intent query = new Intent(Intent.ACTION_MAIN);
+            query.addCategory(Intent.CATEGORY_LAUNCHER);
+            query.setPackage(target);
+            List<ResolveInfo> launchers = pm.queryIntentActivities(query, 0);
+            if (launchers == null || launchers.isEmpty()) return "no_launch_intent:" + target;
+
+            ResolveInfo best = launchers.get(0);
+            if (best == null || best.activityInfo == null) return "no_launch_activity:" + target;
+
+            Intent explicit = new Intent(Intent.ACTION_MAIN);
+            explicit.addCategory(Intent.CATEGORY_LAUNCHER);
+            explicit.setClassName(best.activityInfo.packageName, best.activityInfo.name);
+            explicit.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+            ctx.startActivity(explicit);
+            return "opened_launcher_activity:" + best.activityInfo.packageName + "/" + best.activityInfo.name;
+        } catch (Exception e) {
+            return "activity_start_failed:" + target + ":" + ScreenshotService.shortMsg(e);
+        }
     }
 
     public static boolean showReminderNotification(Context ctx, String title, String message) {
@@ -160,16 +317,22 @@ public class CompanionService extends Service {
             if (Build.VERSION.SDK_INT >= 33 && ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return false;
             NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm == null) return false;
+            String safeTitle = (title == null || title.trim().isEmpty()) ? "掌心窗提醒" : title.trim();
+            String safeMessage = (message == null || message.trim().isEmpty()) ? "宝宝，看一眼这里。" : message.trim();
+
+            Intent detail = new Intent(ctx, ReminderActivity.class);
+            detail.putExtra("title", safeTitle);
+            detail.putExtra("message", safeMessage);
+            detail.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            PendingIntent pi = PendingIntent.getActivity(ctx, (int)(System.currentTimeMillis() % 100000), detail, Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT : PendingIntent.FLAG_UPDATE_CURRENT);
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                NotificationChannel channel = new NotificationChannel(REMINDER_CHANNEL_ID, "掌心窗提醒", NotificationManager.IMPORTANCE_DEFAULT);
-                channel.setDescription("来自掌心窗的生活提醒与轻通知");
+                NotificationChannel channel = new NotificationChannel(REMINDER_CHANNEL_ID, "掌心窗悬浮横幅提醒", NotificationManager.IMPORTANCE_HIGH);
+                channel.setDescription("像微信消息一样从顶部弹出的横幅提醒；点开后可进入详情页。");
+                channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                channel.enableVibration(true);
                 nm.createNotificationChannel(channel);
             }
-            Intent open = new Intent(ctx, MainActivity.class);
-            open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-            PendingIntent pi = PendingIntent.getActivity(ctx, 0, open, Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
-            String safeTitle = (title == null || title.trim().isEmpty()) ? "掌心窗提醒" : title.trim();
-            String safeMessage = (message == null || message.trim().isEmpty()) ? "看一眼这里。" : message.trim();
             Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? new Notification.Builder(ctx, REMINDER_CHANNEL_ID) : new Notification.Builder(ctx);
             Notification n = builder
                     .setContentTitle(safeTitle)
@@ -177,10 +340,16 @@ public class CompanionService extends Service {
                     .setSmallIcon(android.R.drawable.ic_dialog_info)
                     .setContentIntent(pi)
                     .setAutoCancel(true)
+                    .setCategory(Notification.CATEGORY_MESSAGE)
+                    .setPriority(Notification.PRIORITY_HIGH)
+                    .setDefaults(Notification.DEFAULT_SOUND | Notification.DEFAULT_VIBRATE)
+                    .setWhen(System.currentTimeMillis())
+                    .setShowWhen(true)
                     .build();
             nm.notify((int)(System.currentTimeMillis() % Integer.MAX_VALUE), n);
+            DebugState.append(ctx, "悬浮横幅通知已发送：" + safeTitle);
             return true;
-        } catch (Exception e) { return false; }
+        } catch (Exception e) { DebugState.append(ctx, "悬浮横幅通知异常：" + ScreenshotService.shortMsg(e)); return false; }
     }
 
     private static boolean setAlarm(Context ctx, int hour, int minute, String message, boolean vibrate, boolean skipUi) {
@@ -203,6 +372,7 @@ public class CompanionService extends Service {
         JSONObject state = LifeState.collect(ctx);
         postJson(serverUrl + "/api/device/state", token, state);
         ActiveReminder.evaluate(ctx, state);
+        HomeMode.evaluate(ctx, state);
     }
     private static void uploadState(String serverUrl, String token) throws Exception {
         Context ctx = ScreenshotService.getInstance();
@@ -224,7 +394,7 @@ public class CompanionService extends Service {
         return new String(bos.toByteArray(), "UTF-8");
     }
 
-    private void createNotificationChannel() { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) { NotificationManager nm = getSystemService(NotificationManager.class); NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "掌心窗", NotificationManager.IMPORTANCE_LOW); channel.setDescription("掌心窗正在等待你授权的截图与手机动作请求"); nm.createNotificationChannel(channel); NotificationChannel reminder = new NotificationChannel(REMINDER_CHANNEL_ID, "掌心窗提醒", NotificationManager.IMPORTANCE_DEFAULT); reminder.setDescription("来自掌心窗的生活提醒与轻通知"); nm.createNotificationChannel(reminder); } }
+    private void createNotificationChannel() { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) { NotificationManager nm = getSystemService(NotificationManager.class); NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "掌心窗", NotificationManager.IMPORTANCE_LOW); channel.setDescription("掌心窗正在等待你授权的截图与手机动作请求"); nm.createNotificationChannel(channel); NotificationChannel reminder = new NotificationChannel(REMINDER_CHANNEL_ID, "掌心窗悬浮横幅提醒", NotificationManager.IMPORTANCE_HIGH); reminder.setDescription("来自掌心窗的悬浮横幅、生活提醒与回家模式"); reminder.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC); reminder.enableVibration(true); nm.createNotificationChannel(reminder); } }
     private Notification buildNotification(String text) { Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this); return builder.setContentTitle("掌心窗运行中").setContentText(text).setSmallIcon(android.R.drawable.ic_menu_view).setOngoing(true).build(); }
     @Override public void onDestroy() { running = false; DebugState.append(this, "服务已销毁/停止"); if (pollThread != null) pollThread.quitSafely(); super.onDestroy(); }
 }

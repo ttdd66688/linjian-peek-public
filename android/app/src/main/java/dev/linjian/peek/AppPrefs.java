@@ -3,6 +3,12 @@ package dev.linjian.peek;
 import android.content.Context;
 import android.content.SharedPreferences;
 
+import org.json.JSONObject;
+
+import java.util.LinkedHashMap;
+import java.util.Locale;
+import java.util.Map;
+
 public class AppPrefs {
     public static final String PREFS = "linjian_peek";
     public static final String KEY_SERVER = "server_url";
@@ -26,15 +32,85 @@ public class AppPrefs {
     public static final String KEY_PERIOD_LENGTH = "cycle_period_length_days";
     public static final String KEY_CYCLE_REMIND_BEFORE = "cycle_remind_before_days";
 
+    public static final String KEY_FOREGROUND_POPUP = "foreground_popup_enabled";
+    public static final String KEY_CUSTOM_APPS = "custom_apps_lines";
+    public static final String KEY_HOME_MODE_ENABLED = "home_mode_enabled";
+    public static final String KEY_HOME_MODE_FORCE = "home_mode_force";
+    public static final String KEY_HOME_WATCH_PACKAGES = "home_mode_watch_packages";
+    public static final String KEY_HOME_THRESHOLD_MIN = "home_mode_threshold_min";
+    public static final String KEY_HOME_COOLDOWN_MIN = "home_mode_cooldown_min";
+    public static final String KEY_HOME_TARGET_PACKAGE = "home_mode_target_package";
+
     public static SharedPreferences get(Context ctx) { return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE); }
     public static String server(Context ctx) { return get(ctx).getString(KEY_SERVER, ""); }
     public static String token(Context ctx) { return get(ctx).getString(KEY_TOKEN, ""); }
-    public static String device(Context ctx) { return get(ctx).getString(KEY_DEVICE, "my-phone"); }
+    public static String device(Context ctx) { return get(ctx).getString(KEY_DEVICE, "android-phone"); }
     public static int interval(Context ctx) { return Math.max(700, get(ctx).getInt(KEY_INTERVAL, 1500)); }
+
+    public static Map<String, String> defaultApps() {
+        LinkedHashMap<String, String> apps = new LinkedHashMap<>();
+        apps.put("小红书", "com.xingin.xhs");
+        apps.put("微信", "com.tencent.mm");
+        apps.put("QQ", "com.tencent.mobileqq");
+        apps.put("抖音", "com.ss.android.ugc.aweme");
+        apps.put("ChatGPT", "com.openai.chatgpt");
+        apps.put("Speedcat", "");
+        return apps;
+    }
+
+    public static Map<String, String> allApps(Context ctx) {
+        LinkedHashMap<String, String> apps = new LinkedHashMap<>(defaultApps());
+        String custom = get(ctx).getString(KEY_CUSTOM_APPS, "");
+        String[] lines = custom.split("\\n");
+        for (String line : lines) {
+            if (line == null) continue;
+            String s = line.trim();
+            if (s.isEmpty() || !s.contains("|")) continue;
+            String[] parts = s.split("\\|", 2);
+            String alias = parts[0].trim();
+            String pkg = parts.length > 1 ? parts[1].trim() : "";
+            if (!alias.isEmpty() && isPackageLike(pkg)) apps.put(alias, pkg);
+        }
+        return apps;
+    }
+
+    public static void saveCustomApp(Context ctx, String alias, String pkg) {
+        alias = alias == null ? "" : alias.trim();
+        pkg = pkg == null ? "" : pkg.trim();
+        if (alias.isEmpty() || !isPackageLike(pkg)) return;
+        LinkedHashMap<String, String> custom = new LinkedHashMap<>();
+        String old = get(ctx).getString(KEY_CUSTOM_APPS, "");
+        for (String line : old.split("\\n")) {
+            if (line == null || !line.contains("|")) continue;
+            String[] parts = line.trim().split("\\|", 2);
+            if (parts.length == 2 && !parts[0].trim().isEmpty() && isPackageLike(parts[1].trim())) custom.put(parts[0].trim(), parts[1].trim());
+        }
+        custom.put(alias, pkg);
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, String> e : custom.entrySet()) sb.append(e.getKey()).append("|").append(e.getValue()).append("\n");
+        get(ctx).edit().putString(KEY_CUSTOM_APPS, sb.toString()).putString("pkg_" + alias.toLowerCase(Locale.US), pkg).apply();
+    }
+
+    public static String knownAppsText(Context ctx) {
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, String> e : allApps(ctx).entrySet()) {
+            sb.append(e.getKey()).append("  →  ").append(e.getValue().isEmpty() ? "未设置" : e.getValue()).append("\n");
+        }
+        return sb.toString().trim();
+    }
+
+    public static JSONObject knownAppsJson(Context ctx) {
+        JSONObject o = new JSONObject();
+        try {
+            for (Map.Entry<String, String> e : allApps(ctx).entrySet()) o.put(e.getKey(), e.getValue());
+        } catch (Exception ignored) { }
+        return o;
+    }
 
     public static String packageForApp(Context ctx, String app) {
         String raw = app == null ? "" : app.trim();
-        String key = raw.toLowerCase();
+        if (isPackageLike(raw)) return raw;
+        String key = raw.toLowerCase(Locale.US);
         String def;
         switch (key) {
             case "xiaohongshu": case "xhs": case "小红书": def = "com.xingin.xhs"; break;
@@ -45,6 +121,17 @@ public class AppPrefs {
             case "speedcat": def = get(ctx).getString("pkg_speedcat", ""); break;
             default: def = "";
         }
-        return get(ctx).getString("pkg_" + key, def);
+        String custom = get(ctx).getString("pkg_" + key, def);
+        if (custom != null && custom.trim().length() > 0) return custom.trim();
+        for (Map.Entry<String, String> e : allApps(ctx).entrySet()) {
+            if (e.getKey().equalsIgnoreCase(raw)) return e.getValue();
+        }
+        return def;
+    }
+
+    public static boolean isPackageLike(String value) {
+        if (value == null) return false;
+        String s = value.trim();
+        return s.matches("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)+");
     }
 }
